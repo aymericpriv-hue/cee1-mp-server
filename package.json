@@ -1,0 +1,16 @@
+{
+  "name": "cee1-multiplayer-server",
+  "version": "1.0.0",
+  "description": "Serveur temps réel (Node.js + Express + Socket.io) pour les modes Duel 1v1 et Bataille de Section du site CEE1-Quiz",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": { "node": ">=18" },
+  "dependencies": {
+    "express": "^4.19.2",
+    "socket.io": "^4.7.5",
+    "cors": "^2.8.5",
+    "firebase-admin": "^12.0.0"
+  }
+}
