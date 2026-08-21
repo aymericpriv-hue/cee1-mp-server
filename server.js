@@ -54,6 +54,97 @@ app.get('/', (req, res) => res.send('CEE1-Quiz multiplayer server — OK'));
 // Petite route de "santé" pratique pour vérifier que le serveur tourne,
 // et pour éviter qu'il ne s'endorme sur les hébergeurs gratuits (voir doc).
 app.get('/health', (req, res) => res.json({ ok: true, rooms: rooms.size }));
+/* ============================================================
+   STRIPE : déblocage automatique du Premium après paiement
+   Le webhook doit lire le corps BRUT (avant express.json) pour
+   pouvoir vérifier la signature — d'où sa position ici.
+   ============================================================ */
+const crypto = require('crypto');
+
+// Vérifie la signature Stripe sans dépendance externe (HMAC-SHA256).
+// Retourne l'événement décodé, ou null si la signature est invalide/périmée.
+function verifyStripeSignature(rawBody, signatureHeader, secret, nowSec) {
+  if (!rawBody || !signatureHeader || !secret) return null;
+  const parts = {};
+  String(signatureHeader).split(',').forEach(p => {
+    const i = p.indexOf('=');
+    if (i === -1) return;
+    const k = p.slice(0, i).trim();
+    const v = p.slice(i + 1).trim();
+    if (k === 'v1') { parts.v1 = parts.v1 || []; parts.v1.push(v); }
+    else parts[k] = v;
+  });
+  if (!parts.t || !parts.v1 || parts.v1.length === 0) return null;
+
+  // Rejette les événements de plus de 5 minutes (protection contre le rejeu)
+  const age = Math.abs((nowSec || Math.floor(Date.now() / 1000)) - parseInt(parts.t, 10));
+  if (isNaN(age) || age > 300) return null;
+
+  const expected = crypto.createHmac('sha256', secret)
+    .update(parts.t + '.' + rawBody.toString('utf8'), 'utf8')
+    .digest('hex');
+
+  const match = parts.v1.some(sig => {
+    if (sig.length !== expected.length) return false;
+    try { return crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected)); }
+    catch (e) { return false; }
+  });
+  if (!match) return null;
+
+  try { return JSON.parse(rawBody.toString('utf8')); }
+  catch (e) { return null; }
+}
+
+// Extrait l'UID et le montant d'un événement de paiement réussi
+function extractPaidUid(event) {
+  if (!event || event.type !== 'checkout.session.completed') return null;
+  const session = (event.data && event.data.object) || {};
+  if (session.payment_status !== 'paid') return null;
+  const uid = session.client_reference_id;
+  if (typeof uid !== 'string' || uid.length < 6 || uid.length > 128) return null;
+  return {
+    uid: uid,
+    email: (session.customer_details && session.customer_details.email) || '',
+    amount: session.amount_total || 0,
+    currency: session.currency || 'eur',
+    sessionId: session.id || ''
+  };
+}
+
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const secret = process.env.STRIPE_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error('[stripe] STRIPE_WEBHOOK_SECRET absent des variables Render');
+    return res.status(503).send('Webhook non configuré');
+  }
+  const event = verifyStripeSignature(req.body, req.headers['stripe-signature'], secret);
+  if (!event) {
+    console.warn('[stripe] signature invalide — requête rejetée');
+    return res.status(400).send('Signature invalide');
+  }
+
+  const paid = extractPaidUid(event);
+  if (!paid) return res.json({ received: true }); // événement sans intérêt pour nous
+
+  try {
+    await admin.firestore().collection('access').doc(paid.uid).set({
+      paid: true,
+      source: 'stripe',
+      email: paid.email,
+      amount: paid.amount,
+      currency: paid.currency,
+      sessionId: paid.sessionId,
+      paidAt: admin.firestore.FieldValue.serverTimestamp()
+    }, { merge: true });
+    console.log('[stripe] Premium débloqué pour', paid.uid, '(' + (paid.amount / 100) + ' ' + paid.currency + ')');
+    res.json({ received: true });
+  } catch (e) {
+    console.error('[stripe] écriture Firestore impossible :', e.message);
+    // 500 => Stripe réessaiera automatiquement pendant 3 jours
+    res.status(500).send('Erreur serveur');
+  }
+});
+
 app.use(express.json());
 
 // ============================================================
@@ -268,6 +359,48 @@ app.post('/ai/generate-fiches', async (req, res) => {
     if (e.message === 'NO_KEY') return res.status(503).json({ error: 'Fonction IA pas encore activée par l\'administrateur.' });
     console.error('[ai/generate-fiches]', e.message);
     res.status(502).json({ error: 'Service IA indisponible — réessaie dans un instant.' });
+  }
+});
+
+// Agrège le suivi d'erreurs de tous les élèves : quelles questions la promo rate le plus
+function aggregateQuestionStats(progressDocs, minAttempts) {
+  const perId = {};
+  progressDocs.forEach(d => {
+    const missed = (d && d.missed) || {};
+    Object.keys(missed).forEach(id => {
+      const rec = missed[id] || {};
+      const wrong = parseInt(rec.wrong, 10) || 0;
+      const right = parseInt(rec.right, 10) || 0;
+      if (wrong + right === 0) return;
+      if (!perId[id]) perId[id] = { id, wrong: 0, right: 0, learners: 0 };
+      perId[id].wrong += wrong;
+      perId[id].right += right;
+      perId[id].learners++;
+    });
+  });
+  return Object.keys(perId)
+    .map(id => {
+      const r = perId[id];
+      const total = r.wrong + r.right;
+      return { id: r.id, wrong: r.wrong, right: r.right, total, learners: r.learners, failPct: Math.round(r.wrong / total * 100) };
+    })
+    .filter(r => r.total >= (minAttempts || 3))
+    .sort((a, b) => b.failPct - a.failPct || b.total - a.total);
+}
+
+// Stats par question : le classement des items les plus ratés par la promo
+app.post('/admin/question-stats', async (req, res) => {
+  const adminUid = await requireAdmin(req, res);
+  if (!adminUid) return;
+  try {
+    const snap = await admin.firestore().collection('progress').limit(500).get();
+    const docs = [];
+    snap.forEach(doc => docs.push(doc.data()));
+    const rows = aggregateQuestionStats(docs, 3);
+    res.json({ ok: true, learners: docs.length, rows: rows.slice(0, 60) });
+  } catch (e) {
+    console.error('[admin/question-stats]', e.message);
+    res.status(500).json({ error: 'Erreur serveur pendant le calcul.' });
   }
 });
 
